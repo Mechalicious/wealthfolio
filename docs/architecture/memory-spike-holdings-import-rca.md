@@ -69,21 +69,30 @@ The only guard is `start > end → return empty`. A snapshot at year 0224 sets
 `end = 2924` (≈ 328,000 days). Either poisons the window for **every subsequent
 recalculation** of that account.
 
-### 2.3 The pipeline materialises O(days × assets) in memory
+### 2.3 The pipeline materialises O(days × positions-in-poisoned-snapshot) in memory
 
 For the poisoned window, `calculate_valuation_history`
 (`crates/core/src/portfolio/valuation/valuation_service.rs:1661`) allocates, simultaneously:
 
-| Allocation | Source | ~658k-day window, 51 tickers |
+| Allocation | Source | Scaling |
 |---|---|---|
-| One deep-cloned `AccountStateSnapshot` **per calendar day** (all positions, ~380 B each) | `get_daily_holdings_snapshots`, `snapshot_service.rs:1313` | ~13 GB |
-| One forward-filled `Quote` struct (~6 heap `String`s) **per asset per day** | `fill_missing_quotes`, `crates/core/src/quotes/service.rs:2429-2435` | ~12 GB |
-| Per-day FX maps, per-day cloned quote maps, output valuation rows | `valuation_service.rs:342-379, 1838-1844` | ~1–2 GB |
+| One deep-cloned `AccountStateSnapshot` **per calendar day** | `get_daily_holdings_snapshots`, `snapshot_service.rs:1313` | days × **positions carried on that day** (~400 B + map overhead per position) |
+| One forward-filled `Quote` struct (~6 heap `String`s) per asset per day — **but only from each ticker's first real quote onward** (`last_known_quotes` starts empty) | `fill_missing_quotes`, `crates/core/src/quotes/service.rs:2394-2435` | assets × real quote history (~300 MB for 51 tickers), **not** the poisoned window |
+| Per-day FX maps, per-day cloned quote maps, output valuation rows | `valuation_service.rs:342-379, 1838-1844` | bounded by quote-covered days |
 
-≈ **25–27 GB per pipeline run**, and the run never completes — allocation grows with the day
-loop until the OS intervenes. `fetch_fx_rates_for_range` additionally performs a graph BFS per
-(day × currency-pair), so the refresh also spins CPU for hours — matching "application was
-trying to refresh data".
+The dominant term is the per-day snapshot clone, and it scales with **how many positions the
+bad-dated snapshot carries** across the poisoned prefix (the pre-first-quote days are skipped
+for valuation output by quote gating, but the snapshot clones happen before gating):
+
+| Scenario (658k-day window) | Per-day clone | Per pipeline | × 2 pipelines |
+|---|---|---|---|
+| **One** mangled row (1 position carried) | ~1 KB | ~0.7 GB | **~1.5–2 GB** — *empirically confirmed 2026-07-25: 2 GB spike, settles at 600 MB* |
+| **Whole date column** mangled (51 positions carried) | ~24 KB | ~16 GB | **~32 GB+** — runaway until the OS intervenes |
+
+The reporter's 44.9 GB therefore implies the **entire date column** was mangled (an
+export/locale/spreadsheet reformat affecting every row identically), not a single-row typo.
+`fetch_fx_rates_for_range` additionally performs a graph BFS per (day × currency-pair), so the
+refresh also spins CPU — matching "application was trying to refresh data".
 
 ### 2.4 Amplifier: the import triggers TWO concurrent full pipelines
 
@@ -111,7 +120,11 @@ account.
 **Confirmed in code:** the validation gap; the unclamped window; the per-day materialisation
 sizes; the double-trigger with no shared guard; the `since_date=None → Full` planner mapping.
 
-**Reproduced:** pending — repro CSVs are prepared (§3).
+**Reproduced (partial, 2026-07-25):** the single-row variant (`holdings-repro-oom.csv`, one row
+dated `0224`) was run on a real Mac: **2 GB spike, settling at 600 MB** — a ~40× amplification
+over a sane import, confirming the mechanism and the §2.3 single-row arithmetic. The
+whole-column variant (`holdings-repro-oom-v2.csv`, all rows dated `0224`, projected ~32 GB) is
+the candidate for the reporter's full 44.9 GB scenario and is pending a run.
 
 **Inferred, awaiting reporter's data:** that their CSV actually contained a mangled date. The
 arithmetic requires it (§1.2), but it has not yet been observed. Diagnostic for the reporter:
@@ -136,14 +149,16 @@ net-worth quote grid (alternative assets only).
 Two CSVs (51 tickers + `$CASH`, all dated `2026-07-20`, except **one row — DIS — with a
 mangled year**), matching the holdings CSV wizard format:
 
-| File | Bad row | Expected |
+| File | Bad date(s) | Result |
 |---|---|---|
-| `holdings-repro-mild.csv` | `1924-07-20,DIS,60,98.75,USD` | ~37k-day window: minutes-long refresh, multi-GB spike, survivable. Validate the mechanism with this first. |
-| `holdings-repro-oom.csv` | `0224-07-20,DIS,60,98.75,USD` | ~658k-day window: runaway allocation until the macOS out-of-memory dialog. The reporter's scenario. |
+| `holdings-repro-mild.csv` | one row at `1924-07-20` | ~37k-day window, sub-GB spike. Mechanism smoke test. |
+| `holdings-repro-oom.csv` | one row at `0224-07-20` | ~658k-day window carrying **1 position**: **observed 2 GB spike → settles at 600 MB**. |
+| `holdings-repro-oom-v2.csv` | **all 52 rows** at `0224-07-20` | ~658k-day window carrying **51 positions**: projected ~16 GB/pipeline, ~32 GB with the double trigger — the reporter's scenario. Pending run. |
 
 Steps: back up the DB → new HOLDINGS-mode account → import CSV via the holdings wizard
-(observe: **no validation error on the mangled row**) → watch Activity Monitor as the
-post-import refresh starts. Recovery:
+(observe: **no validation error on the mangled dates**) → watch Activity Monitor as the
+post-import refresh starts. Between runs, remove the poisoned rows — they persist and re-poison
+every later refresh of that account. Recovery:
 `DELETE FROM holdings_snapshots WHERE snapshot_date < '1990-01-01';` then recalculate.
 
 ---

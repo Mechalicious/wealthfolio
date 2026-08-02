@@ -1,9 +1,10 @@
 # RCA: Multi-GB Memory Spike After Holdings CSV Import
 
-**Status:** Root cause **CONFIRMED** by controlled reproduction (2026-07-26): identical 51-ticker
-CSVs differing only in the snapshot year — `0224` reproduces the runaway/OOM, `2024` stays under
-200 MB. Awaiting the reporter's data only to confirm which mangling produced their bad date.
-**Date:** 2026-07-25
+**Status:** Root cause **CONFIRMED** by controlled reproduction: identical 51-ticker CSVs
+differing only in the snapshot year — `0224` reproduces the runaway/OOM, `2024` stays under
+200 MB. Fixes proposed (§4), not yet implemented. Awaiting the reporter's data only to confirm
+which mangling produced their bad date.
+**Last updated:** 2026-08-02
 **Severity:** Critical — app becomes unusable, macOS kills the process
 **Affected area:** Holdings CSV import → post-import refresh (market sync + valuation
 recalculation)
@@ -87,8 +88,8 @@ for valuation output by quote gating, but the snapshot clones happen before gati
 
 | Scenario (658k-day window) | Per-day clone | Per pipeline | × 2 pipelines |
 |---|---|---|---|
-| **One** mangled row (1 position carried) | ~1 KB | ~0.7 GB | **~1.5–2 GB** — *empirically confirmed 2026-07-25: 2 GB spike, settles at 600 MB* |
-| **Whole date column** mangled (51 positions carried) | ~24 KB | ~16 GB | **~32 GB+** — runaway until the OS intervenes |
+| **One** mangled row (1 position carried) | ~1 KB | ~0.7 GB | **~1.5–2 GB** — *measured: 2 GB spike, settles at 600 MB* |
+| **Whole date column** mangled (51 positions carried) | ~24 KB | ~16 GB | **~32 GB+** — *measured: runaway until the macOS OOM dialog* |
 
 The reporter's 44.9 GB therefore implies the **entire date column** was mangled (an
 export/locale/spreadsheet reformat affecting every row identically), not a single-row typo.
@@ -121,7 +122,7 @@ account.
 **Confirmed in code:** the validation gap; the unclamped window; the per-day materialisation
 sizes; the double-trigger with no shared guard; the `since_date=None → Full` planner mapping.
 
-**Reproduced and controlled (2026-07-25/26), on a real Mac:**
+**Reproduced and controlled on a real Mac (this investigation):**
 
 | File | Only difference | Window | Measured |
 |---|---|---|---|
@@ -133,8 +134,9 @@ The control and the OOM file are byte-identical except the date field (same tick
 quantities, prices, cash), so the snapshot date is isolated as the sole cause. Memory scales
 with (window length × positions carried), exactly as modelled in §2.3.
 
-**Inferred, awaiting reporter's data:** that their CSV actually contained a mangled date. The
-arithmetic requires it (§1.2), but it has not yet been observed. Diagnostic for the reporter:
+**Remaining open item (does not affect the root cause):** which mangling produced the
+reporter's bad date. The controlled experiment proves the mechanism and the magnitude; the
+whole-column variant matches their 44.9 GB. Diagnostic to send the reporter:
 
 ```sql
 SELECT account_id, snapshot_date FROM holdings_snapshots ORDER BY snapshot_date ASC  LIMIT 3;
@@ -153,20 +155,25 @@ net-worth quote grid (alternative assets only).
 
 ## 3. Reproduction
 
-Two CSVs (51 tickers + `$CASH`, all dated `2026-07-20`, except **one row — DIS — with a
-mangled year**), matching the holdings CSV wizard format:
+A family of CSVs in the holdings-wizard format (51 real tickers + `$CASH`, identical
+quantities/prices from a fixed seed), differing **only in the date field**. This makes the
+experiment a controlled comparison: the control and the OOM file are byte-identical except the
+year, so the observed memory difference is attributable to the date alone.
 
-| File | Bad date(s) | Result |
-|---|---|---|
-| `holdings-control-2024.csv` | none (all rows `2024-07-20`) | **Measured: < 200 MB**, completes in seconds. The control — byte-identical to the OOM file except the date field. |
-| `holdings-repro-mild.csv` / `holdings-dose-1924.csv` | `1924-07-20` (one row / all rows) | ~37k-day window; intermediate dose point (projected ~2 GB for the all-rows variant). |
-| `holdings-repro-oom.csv` | one row at `0224-07-20` | ~658k-day window carrying **1 position**: **measured 2 GB spike → settles at 600 MB**. |
-| `holdings-repro-oom-v2.csv` | **all 52 rows** at `0224-07-20` | ~658k-day window carrying **51 positions**: **measured runaway → macOS OOM dialog** — the reporter's scenario. |
+| File | Date field | Window | Result |
+|---|---|---|---|
+| `holdings-control-2024.csv` | all rows `2024-07-20` | ~740 days | **Measured: < 200 MB**, completes in seconds |
+| `holdings-repro-mild.csv` / `holdings-dose-1924.csv` | `1924-07-20` (one row / all rows) | ~37k days | intermediate dose point, not run (unnecessary once the control confirmed) |
+| `holdings-repro-oom.csv` | **one** row at `0224-07-20` | ~658k days × 1 position | **Measured: 2 GB spike → settles at 600 MB** |
+| `holdings-repro-oom-v2.csv` | **all 52 rows** at `0224-07-20` | ~658k days × 51 positions | **Measured: runaway → macOS OOM dialog** — the reporter's scenario |
 
-Steps: back up the DB → new HOLDINGS-mode account → import CSV via the holdings wizard
+Steps: back up the DB → new HOLDINGS-mode account per file → import via the holdings CSV wizard
 (observe: **no validation error on the mangled dates**) → watch Activity Monitor as the
-post-import refresh starts. Between runs, remove the poisoned rows — they persist and re-poison
-every later refresh of that account. Recovery:
+post-import refresh starts.
+
+**Cleanup between runs and after testing (important):** the poisoned rows persist and re-poison
+every later refresh of their account — including on the tester's own machine. Delete the test
+accounts, or run:
 `DELETE FROM holdings_snapshots WHERE snapshot_date < '1990-01-01';` then recalculate.
 
 ---
@@ -222,13 +229,34 @@ that makes the problem recur.
 
 ---
 
-## 5. Timeline / Links
+## 5. Next Steps
+
+1. **Implement F1–F3** (small, independent patches — none started yet):
+   F1 turns this whole bug class into a friendly per-row validation error in the import wizard;
+   F2 protects every existing database that may already contain a bad date from any source;
+   F3 halves the cost of every import, sane or not.
+2. **Reply to the reporter** with: (a) the workaround —
+   `DELETE FROM holdings_snapshots WHERE snapshot_date < '1990-01-01';` (adjust the bound if
+   their bad date is in the future: `... > date('now')`) then recalculate, memory returns to
+   normal immediately; (b) the diagnostic SQL from §2.5, or simply ask for their CSV's date
+   column — if their bad snapshot carries all 51 positions, the last open item closes;
+   (c) confirmation that a validation fix is planned.
+3. **Update #1347** — the sane-date portion of these findings (double trigger, O(days × assets)
+   materialisation) is the same mechanism behind that issue; F3 + F4 are the relevant fixes.
+4. **Regression tests** alongside F1/F2: import wizard rejects out-of-range dates; valuation
+   window stays clamped even with a hostile `snapshot_date` planted in the repository.
+
+---
+
+## 6. Timeline / Links
 
 - [PR #1218](https://github.com/wealthfolio/wealthfolio/pull/1218) — snapshot bloat fix; same
   pipeline, sane-date magnitude (1.5–2 GB).
 - [#1347](https://github.com/wealthfolio/wealthfolio/issues/1347) — 5+ year history memory and
   timeout reports.
 - Direct user report (2026-07) — 44.9 GB spike on 51-ticker holdings CSV import; this RCA.
+- Controlled reproduction (2026-07/08, this RCA §2.5/§3) — control < 200 MB; single bad row
+  2 GB; whole bad column → OOM. Root cause confirmed.
 - [`valuation-performance-review-and-target-design.md`](./valuation-performance-review-and-target-design.md)
   — full architecture review; §2.2 (compute hot spots) and §4.3 (WS-B) are the structural
   context for F4.

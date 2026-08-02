@@ -1,7 +1,8 @@
 # RCA: Multi-GB Memory Spike After Holdings CSV Import
 
-**Status:** Root cause identified (mechanism confirmed in code; awaiting confirmation from the
-reporter's data)
+**Status:** Root cause **CONFIRMED** by controlled reproduction (2026-07-26): identical 51-ticker
+CSVs differing only in the snapshot year — `0224` reproduces the runaway/OOM, `2024` stays under
+200 MB. Awaiting the reporter's data only to confirm which mangling produced their bad date.
 **Date:** 2026-07-25
 **Severity:** Critical — app becomes unusable, macOS kills the process
 **Affected area:** Holdings CSV import → post-import refresh (market sync + valuation
@@ -120,11 +121,17 @@ account.
 **Confirmed in code:** the validation gap; the unclamped window; the per-day materialisation
 sizes; the double-trigger with no shared guard; the `since_date=None → Full` planner mapping.
 
-**Reproduced (partial, 2026-07-25):** the single-row variant (`holdings-repro-oom.csv`, one row
-dated `0224`) was run on a real Mac: **2 GB spike, settling at 600 MB** — a ~40× amplification
-over a sane import, confirming the mechanism and the §2.3 single-row arithmetic. The
-whole-column variant (`holdings-repro-oom-v2.csv`, all rows dated `0224`, projected ~32 GB) is
-the candidate for the reporter's full 44.9 GB scenario and is pending a run.
+**Reproduced and controlled (2026-07-25/26), on a real Mac:**
+
+| File | Only difference | Window | Measured |
+|---|---|---|---|
+| `holdings-control-2024.csv` | all rows dated `2024-07-20` | ~740 days | **< 200 MB**, refresh completes normally |
+| `holdings-repro-oom.csv` | **one** row dated `0224-07-20` | ~658k days × 1 position | **2 GB spike**, settles at 600 MB |
+| `holdings-repro-oom-v2.csv` | **all** rows dated `0224-07-20` | ~658k days × 51 positions | **runaway → macOS OOM** (reporter's scenario) |
+
+The control and the OOM file are byte-identical except the date field (same tickers,
+quantities, prices, cash), so the snapshot date is isolated as the sole cause. Memory scales
+with (window length × positions carried), exactly as modelled in §2.3.
 
 **Inferred, awaiting reporter's data:** that their CSV actually contained a mangled date. The
 arithmetic requires it (§1.2), but it has not yet been observed. Diagnostic for the reporter:
@@ -151,9 +158,10 @@ mangled year**), matching the holdings CSV wizard format:
 
 | File | Bad date(s) | Result |
 |---|---|---|
-| `holdings-repro-mild.csv` | one row at `1924-07-20` | ~37k-day window, sub-GB spike. Mechanism smoke test. |
-| `holdings-repro-oom.csv` | one row at `0224-07-20` | ~658k-day window carrying **1 position**: **observed 2 GB spike → settles at 600 MB**. |
-| `holdings-repro-oom-v2.csv` | **all 52 rows** at `0224-07-20` | ~658k-day window carrying **51 positions**: projected ~16 GB/pipeline, ~32 GB with the double trigger — the reporter's scenario. Pending run. |
+| `holdings-control-2024.csv` | none (all rows `2024-07-20`) | **Measured: < 200 MB**, completes in seconds. The control — byte-identical to the OOM file except the date field. |
+| `holdings-repro-mild.csv` / `holdings-dose-1924.csv` | `1924-07-20` (one row / all rows) | ~37k-day window; intermediate dose point (projected ~2 GB for the all-rows variant). |
+| `holdings-repro-oom.csv` | one row at `0224-07-20` | ~658k-day window carrying **1 position**: **measured 2 GB spike → settles at 600 MB**. |
+| `holdings-repro-oom-v2.csv` | **all 52 rows** at `0224-07-20` | ~658k-day window carrying **51 positions**: **measured runaway → macOS OOM dialog** — the reporter's scenario. |
 
 Steps: back up the DB → new HOLDINGS-mode account → import CSV via the holdings wizard
 (observe: **no validation error on the mangled dates**) → watch Activity Monitor as the

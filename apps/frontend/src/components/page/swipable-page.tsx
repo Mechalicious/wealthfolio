@@ -103,7 +103,7 @@ function MobileNavigation({
     <div
       className={cn(
         "bg-muted/50 flex items-center gap-0.5 rounded-full p-1 backdrop-blur-sm",
-        compact && "min-w-0 max-w-full",
+        compact && "w-fit min-w-0 max-w-full",
       )}
     >
       {views.map((item) => {
@@ -237,12 +237,17 @@ export function SwipablePage({
                 className={cn(
                   "grid w-full items-center gap-2",
                   mobileActionsInHeader
-                    ? "grid-cols-[2.5rem_minmax(0,1fr)_auto] min-[390px]:grid-cols-[4.5rem_minmax(0,1fr)_auto]"
+                    ? "grid-cols-[minmax(0,1fr)_auto] min-[430px]:grid-cols-[2.5rem_minmax(0,1fr)_auto]"
                     : "grid-cols-[1fr_auto_1fr]",
                 )}
               >
-                <div className={mobileActionsInHeader ? "w-10 min-[390px]:w-[4.5rem]" : "w-10"} />
-                <div className={cn("min-w-0", mobileActionsInHeader && "justify-self-center")}>
+                <div className={mobileActionsInHeader ? "hidden w-10 min-[430px]:block" : "w-10"} />
+                <div
+                  className={cn(
+                    "min-w-0",
+                    mobileActionsInHeader && "flex justify-end min-[430px]:justify-center",
+                  )}
+                >
                   <MobileNavigation
                     views={views}
                     currentView={currentView}
